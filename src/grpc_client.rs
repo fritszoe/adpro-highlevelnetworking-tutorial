@@ -1,68 +1,111 @@
-use tonic::transport::Channel;
+use tonic::{transport::Server, Request, Response, Status};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::sync::mpsc::{Sender, Receiver};
-use tokio::io::{self, AsyncBufReadExt};
-
-use services::{payment_service_client::PaymentServiceClient, PaymentRequest,
-    transaction_service_client::TransactionServiceClient, TransactionRequest,
-    chat_service_client::ChatServiceClient, ChatMessage};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 pub mod services {
     tonic::include_proto!("services");
 }
 
+use services::{payment_service_server::{PaymentService, PaymentServiceServer}, PaymentRequest, PaymentResponse,
+    transaction_service_server::{TransactionService, TransactionServiceServer}, TransactionRequest, TransactionResponse,
+    chat_service_server::{ChatService, ChatServiceServer}, ChatMessage};
+
+#[derive(Default)]
+pub struct MyPaymentService {}
+
+#[tonic::async_trait]
+impl PaymentService for MyPaymentService {
+    async fn process_payment(
+        &self,
+        request: Request<PaymentRequest>,
+    ) -> Result<Response<PaymentResponse>, Status> {
+        println!("Received payment request: {:?}", request);
+
+        // Process the request and return a response
+        // This example immediately returns a succesful result for demonstration purposes
+        Ok(Response::new(PaymentResponse { success: true }))
+    }
+}
+
+#[derive(Default)]
+pub struct MyTransactionService {}
+
+#[tonic::async_trait]
+impl TransactionService for MyTransactionService {
+    type GetTransactionHistoryStream = ReceiverStream<Result<TransactionResponse, Status>>;
+
+    async fn get_transaction_history (
+        &self,
+        request: Request<TransactionRequest>,
+    ) -> Result<Response<Self::GetTransactionHistoryStream>, Status> {
+        println!("Received transaction history request: {:?}", request);
+        let (tx, rx): (Sender<Result<TransactionResponse, Status>>, Receiver<Result<TransactionResponse, Status>>) = mpsc::channel(4);
+
+        tokio::spawn(async move {
+            for i in 0..30 { // Simulate sending 30 transaction records
+                if tx.send(Ok(TransactionResponse {
+                    transaction_id: format!("trans_{}", i),
+                    status: "Completed".to_string(),
+                    amount: 100.0,
+                    timestamp: "2024-04-30T12:00:00Z".to_string(),
+                })).await.is_err() {
+                    break;
+                }
+                if i % 10 == 9 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+
+#[derive(Default)]
+pub struct MyChatService {}
+
+#[tonic::async_trait]
+impl ChatService for MyChatService {
+    type ChatStream = ReceiverStream<Result<ChatMessage, Status>>;
+
+    async fn chat (
+        &self,
+        request: Request<tonic::Streaming<ChatMessage>>,
+    ) -> Result<Response<Self::ChatStream>, Status> {
+        let mut stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(10);
+
+        tokio::spawn(async move {
+            while let Some(message) = stream.message().await.unwrap_or_else(|_| None) {
+                println!("Received message: {:?}", message);
+                let reply = ChatMessage {
+                    user_id: message.user_id.clone(),
+                    message: format!("Terima kasih telah melakukan chat kepada CS virtual, Pesan anda akan dibalas pada jam kerja. pesan anda: {}", message.message),
+                };
+
+                tx.send(Ok(reply)).await.unwrap_or_else(|_| {});
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = PaymentServiceClient::connect("http://[::1]:50051").await?;
-    let request = tonic::Request::new(PaymentRequest {
-        user_id: "user_123".to_string(),
-        amount: 100.0,
-    });
+    let addr = "[::1]:50051".parse()?;
+    let payment_service = MyPaymentService::default();
+    let transaction_service = MyTransactionService::default();
+    let chat_service = MyChatService::default();
 
-    let response = client.process_payment(request).await?;
-    println!("RESPONSE={:?}", response.into_inner());
-
-    let mut transaction_client = TransactionServiceClient::connect("http://[::1]:50051").await?;
-    let request = tonic::Request::new(TransactionRequest {
-        user_id: "user_123".to_string(),
-    });
-
-    let mut stream = transaction_client.get_transaction_history(request).await?.into_inner();
-    while let Some(transaction) = stream.message().await? {
-        println!("Transaction: {:?}", transaction);
-    }
-
-    let channel = Channel::from_static("http://[::1]:50051").connect().await?;
-    let mut client = ChatServiceClient::new(channel);
-    let (tx, rx): (Sender<ChatMessage>, Receiver<ChatMessage>) = mpsc::channel(32);
-
-    tokio::spawn(async move {
-        let stdin = io::stdin();
-        let mut reader = io::BufReader::new(stdin).lines();
-
-        while let Ok(Some(line)) = reader.next_line().await {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let message = ChatMessage {
-                user_id: "user_123".to_string(),
-                message: line,
-            };  
-
-            if tx.send(message).await.is_err() {
-                eprintln!("Failed to send message to server.");
-                break;
-            }
-        }
-    });
-
-    let request = tonic::Request::new(ReceiverStream::new(rx));
-    let mut response_stream = client.chat(request).await?.into_inner();
-
-    while let Some(response) = response_stream.message().await? {
-        println!("Server says: {:?}", response);
-    }
+    Server::builder()
+        .add_service(PaymentServiceServer::new(payment_service))
+        .add_service(TransactionServiceServer::new(transaction_service))
+        .add_service(ChatServiceServer::new(chat_service))
+        .serve(addr)
+        .await?;
 
     Ok(())
 }
